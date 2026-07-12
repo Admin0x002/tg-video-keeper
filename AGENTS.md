@@ -18,6 +18,7 @@
 | Telegram 库 | **Telethon** | 1.44.0（v1 稳定分支） | 主流 MTProto UserBot 库；`events.Album` 原生处理相册；`send_message(file=msg)` 干净克隆媒体无转发头 |
 | 配置 | python-dotenv | 1.0.1 | `.env` 管理 API 凭证 |
 | 日志 | logging + RotatingFileHandler | stdlib | 滚动日志，无需第三方依赖 |
+| 依赖管理 | **uv** | 0.11+ | 极快的 Python 包管理器，`pyproject.toml` + `uv.lock` 锁定可复现环境 |
 | 进程守护 | systemd | — | 海外 VPS 24h 挂机 |
 
 ### Telethon 选型说明（重要）
@@ -28,7 +29,7 @@ Telethon v1 的 GitHub 仓库已于 2026-02 归档，v2 迁移至 Codeberg（tel
 2. `events.Album` 原生聚合多图/多视频相册；
 3. `send_message(entity, file=message)` 克隆语义清晰——把消息对象当 file 传入，
    Telethon 自动提取媒体并以 `InputMedia` 重发，生成不带 "转发自" 头部的独立消息；
-4. PyPI 安装稳定，`pip install telethon==1.44.0` 即可。
+4. uv 锁定稳定（`uv sync` 自动安装，版本固定在 `uv.lock`）。
 
 **后续若需最新 Telegram 特性（Stories / Business 等），评估迁移至 Kurigram**
 （Pyrogram 的活跃维护分支，drop-in 替换）。当前需求不涉及这些特性，不提前迁移。
@@ -40,25 +41,29 @@ Telethon v1 的 GitHub 仓库已于 2026-02 归档，v2 迁移至 Codeberg（tel
 # 进入项目目录
 cd /home/emiya/data/workspace/tg-video-keeper
 
-# 创建虚拟环境
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 安装依赖
-pip install -r requirements.txt
+# 安装依赖（uv 自动创建 .venv + uv.lock，含 dev 组 pytest）
+uv sync --all-groups
 
 # 复制配置模板并填写
 cp .env.example .env
 # 编辑 .env 填入 API_ID / API_HASH / TARGET_CHAT_ID 等
 
 # 首次登录（交互式，输入手机号 + 验证码，生成 session 文件）
-python keeper.py --login
+uv run python keeper.py --login
 
 # 前台运行（调试模式，日志同时输出到控制台）
-python keeper.py
+uv run python keeper.py
 
 # 健康检查（打印当前账号信息 + 监听/目标配置，不发任何消息）
-python keeper.py --check
+uv run python keeper.py --check
+```
+
+### 依赖管理（uv）
+```bash
+uv sync --all-groups   # 安装/同步依赖到 .venv
+uv add <包名>           # 新增生产依赖（自动写入 pyproject.toml + 更新 uv.lock）
+uv add --group dev <包名>  # 新增开发依赖
+uv run python keeper.py   # 在 uv 管理的环境中运行脚本
 ```
 
 ### 部署（海外 Linux VPS 24h 挂机）
@@ -78,7 +83,7 @@ tail -f logs/keeper.log
 
 ### 测试
 ```bash
-python -m pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 ## 4. 防错指南（硬性规则）
@@ -89,7 +94,7 @@ python -m pytest tests/ -v
    克隆，确保不带 "转发自" 头部。此为**核心需求**，违反即视为严重缺陷。
 3. **禁止过度工程化。** 不预先实现未要求的功能（多账号、Web 面板、HTTP API 等）。
    遵循 YAGNI；新增功能需经人类负责人确认后再加。
-4. **修改后必须验证。** 任何代码改动后，至少运行 `python keeper.py --check` 确认
+4. **修改后必须验证。** 任何代码改动后，至少运行 `uv run python keeper.py --check` 确认
    配置加载与客户端初始化正常；涉及克隆/删除逻辑的改动需用小文件实测一次。
 5. **Session 文件是登录凭证，禁止提交 git。** `sessions/*.session` 不可入版本库；
    `.env` 不可入版本库。泄露即视为账号被盗风险。
@@ -109,7 +114,8 @@ tg-video-keeper/
 ├── README.md            # 配置 + 部署完整指南（面向零基础）
 ├── .env.example         # 配置模板（复制为 .env 后填写）
 ├── .gitignore
-├── requirements.txt
+├── pyproject.toml       # 项目元数据 + 依赖声明（uv 管理）
+├── uv.lock              # 依赖锁文件（入版本库，保证可复现）
 ├── config.py            # 配置加载层（.env → Config 对象）
 ├── keeper.py            # 主脚本：监听 + 克隆 + 相册聚合 + 自动删除 + 重连
 ├── deploy/

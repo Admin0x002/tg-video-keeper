@@ -11,7 +11,7 @@ send_file(file=message) 克隆（无转发头）→ 收藏夹来源自动删原�
 auto_reconnect + systemd 保活。
 
 ## 技术栈
-Python 3.11+ / Telethon 1.44.0 / python-dotenv / systemd
+Python 3.11+ / Telethon 1.44.0 / python-dotenv / uv（依赖管理）/ systemd
 
 ## 任务清单（对应 MEMORY.md）
 
@@ -35,7 +35,7 @@ Python 3.11+ / Telethon 1.44.0 / python-dotenv / systemd
 
 ## 验证命令
 ```bash
-python -m pytest tests/ -v          # 单测
-python keeper.py --check            # 健康检查
-python keeper.py                    # 前台运行
+uv run pytest tests/ -v             # 单测
+uv run python keeper.py --check     # 健康检查
+uv run python keeper.py             # 前台运行
 ```

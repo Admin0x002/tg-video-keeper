@@ -62,7 +62,7 @@
 
 ```bash
 # 先填好 .env 里的 API_ID / API_HASH，TARGET_CHAT_ID 先留空
-python -c "
+uv run python -c "
 import asyncio
 from telethon import TelegramClient
 import config as cfg
@@ -119,9 +119,16 @@ DELETE_ORIGINAL_FROM_SAVED=true
 
 ### 本地电脑运行
 
-#### 1. 安装 Python 环境
+#### 1. 安装 uv + Python 环境
 
-需要 Python 3.11+。检查：
+本项目用 [uv](https://docs.astral.sh/uv/) 管理依赖。先装 uv（若已装可跳过）：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 或 macOS：brew install uv
+```
+
+需要 Python 3.11+，检查：
 
 ```bash
 python3 --version
@@ -133,13 +140,14 @@ python3 --version
 cd /home/emiya/data/workspace/tg-video-keeper
 ```
 
-#### 3. 创建虚拟环境 + 安装依赖
+#### 3. 安装依赖（uv 自动创建 .venv + 锁文件）
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# 读取 pyproject.toml，创建 .venv 并安装所有依赖（含 dev 组的 pytest）
+uv sync --all-groups
 ```
+
+> 之后任何依赖变更只需 `uv sync`。新增依赖用 `uv add 包名`，无需手动编辑文件。
 
 #### 4. 配置 .env
 
@@ -151,11 +159,11 @@ cp .env.example .env
 #### 5. 首次登录（生成 session 文件）
 
 ```bash
-python keeper.py --login
+uv run python keeper.py --login
 ```
 
 按提示输入：
-- 手机号（带国家区号，如 `+8613800138000`）
+- 手机号（带国家区号，如 `+861****8000`）
 - 收到的验证码
 - （若开启了两步验证）你的密码
 
@@ -164,7 +172,7 @@ python keeper.py --login
 #### 6. 健康检查
 
 ```bash
-python keeper.py --check
+uv run python keeper.py --check
 ```
 
 应输出：配置摘要 + 账号信息 + 目标频道解析成功。
@@ -172,7 +180,7 @@ python keeper.py --check
 #### 7. 前台运行（调试）
 
 ```bash
-python keeper.py
+uv run python keeper.py
 ```
 
 看到 `守护进程运行中` 即表示已在监听。现在从任意频道转发一个视频到收藏夹，
@@ -183,11 +191,11 @@ python keeper.py
 ```bash
 # 方式一：tmux（推荐本地调试）
 tmux new -s keeper
-python keeper.py
+uv run python keeper.py
 # 按 Ctrl+B 然后 D 脱离
 
 # 方式二：nohup
-nohup python keeper.py > /dev/null 2>&1 &
+nohup uv run python keeper.py > /dev/null 2>&1 &
 ```
 
 ---
@@ -212,13 +220,12 @@ rsync -av --exclude='.env' --exclude='sessions' --exclude='logs' --exclude='.ven
 ssh user@your-vps
 cd /home/user/tg-video-keeper
 
-# 安装 Python（Ubuntu/Debian）
-sudo apt update && sudo apt install -y python3 python3-venv python3-pip
+# 安装 uv（VPS 上若没有）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 重开终端或 `source ~/.bashrc` 让 uv 进入 PATH
 
-# 虚拟环境
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# 安装依赖（uv 自动管理 .venv + uv.lock）
+uv sync --all-groups
 ```
 
 #### 3. 配置 + 登录
@@ -226,8 +233,8 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 # 编辑 .env 填入凭证
-python keeper.py --login    # 输入手机号 + 验证码
-python keeper.py --check     # 验证
+uv run python keeper.py --login    # 输入手机号 + 验证码
+uv run python keeper.py --check     # 验证
 ```
 
 #### 4. 配置 systemd 服务
@@ -314,7 +321,7 @@ A: 这是使用你自己账号的 UserBot，只处理你本人转发到收藏夹
    不会触发 Telegram 的批量操作风控。但请勿用于高频批量抓取他人频道。
 
 ### Q: session 文件丢了怎么办？
-A: 重新运行 `python keeper.py --login` 重新登录即可。session 文件等同于登录态，
+A: 重新运行 `uv run python keeper.py --login` 重新登录即可。session 文件等同于登录态，
    务必妥善保管，不要外传。
 
 ### Q: 如何更换备份频道？

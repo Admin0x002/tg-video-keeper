@@ -19,6 +19,7 @@
 - [x] 配置层 `config.py`（`.env` 驱动，缺失即失败）
 - [x] 部署文档 `README.md`（API 申请 / Chat ID 获取 / systemd 挂机）
 - [x] systemd unit 模板 `deploy/tg-video-keeper.service`
+- [x] 依赖管理迁移至 **uv**（`pyproject.toml` + `uv.lock`，移除 requirements.txt）
 
 ## 下一步急需进行的任务（按优先级）
 
@@ -28,22 +29,23 @@
 2. **[人工] 创建私密备份频道** — Telegram 新建一个仅自己可见的频道，
    获取其 Chat ID（方法见 README §配置说明 - 获取 Chat ID）。
 3. **[人工] 填写 `.env`** — `cp .env.example .env`，填入所有值。
-4. **首次登录联调** — `python keeper.py --login`，完成手机号 + 验证码登录，
+4. **安装依赖** — `uv sync --all-groups`（自动创建 `.venv` + `uv.lock`）。
+5. **首次登录联调** — `uv run python keeper.py --login`，完成手机号 + 验证码登录，
    生成 `sessions/keeper.session`。
-5. **实发测试** — 从任意频道转发一个视频到收藏夹，观察：
+6. **实发测试** — 从任意频道转发一个视频到收藏夹，观察：
    - 是否克隆到备份频道（无 "转发自" 头部）；
    - 收藏夹原消息是否被自动删除。
-6. **相册测试** — 转发一个多图相册到收藏夹，验证整体克隆。
+7. **相册测试** — 转发一个多图相册到收藏夹，验证整体克隆。
 
 ### P1 — 可用性增强
-7. 补充 `tests/test_safety.py` 单测（来源白名单 / 用户白名单 / 媒体类型判定）。
-8. 实现 `keeper.py --check` 健康检查子命令（打印账号 + 配置自检）。
-9. VPS 部署联调（systemd 启停、日志查看、断网恢复）。
+8. 补充 `tests/test_safety.py` 单测（来源白名单 / 用户白名单 / 媒体类型判定）。
+9. 实现 `keeper.py --check` 健康检查子命令（打印账号 + 配置自检）。
+10. VPS 部署联调（systemd 启停、日志查看、断网恢复）。
 
 ### P2 — 远期可选
-10. 媒体去重（避免同一视频重复克隆到备份频道，按 `file_unique_id` 判定）。
-11. 备份频道容量 / 消息数监控与告警。
-12. 评估迁移 Telethon v2（Codeberg）或 Kurigram，视 Telegram API 演进而定。
+11. 媒体去重（避免同一视频重复克隆到备份频道，按 `file_unique_id` 判定）。
+12. 备份频道容量 / 消息数监控与告警。
+13. 评估迁移 Telethon v2（Codeberg）或 Kurigram，视 Telegram API 演进而定。
 
 ## 关键决策记录
 
@@ -53,6 +55,7 @@
 | 2026-07-12 | 克隆而非转发 | 核心需求：原频道被封后备份不失效；`send_message(file=)` 不带转发头 |
 | 2026-07-12 | 仅收藏夹来源自动删除原消息 | 保持收藏夹干净；私密频道来源保留原消息（用户未要求删除） |
 | 2026-07-12 | 相册用 `events.Album` 聚合 | Telethon 原生支持，`NewMessage` 中按 `grouped_id` 跳过避免重复 |
+| 2026-07-12 | 依赖管理用 uv | `pyproject.toml`+`uv.lock` 锁定可复现；`uv sync`/`uv add` 比手动 venv+pip 更可靠 |
 
 ## 已知坑点 / 注意事项
 

@@ -1,0 +1,19 @@
+[project]
+name = "tg-video-keeper"
+version = "0.1.0"
+description = "私密 Telegram 媒体克隆守护进程 — 监控收藏夹/私密频道，克隆媒体到备份频道"
+requires-python = ">=3.11"
+dependencies = [
+    "telethon==1.44.0",
+    "python-dotenv==1.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+# 本项目是脚本式应用（keeper.py 在根目录），不是可安装包；
+# 设 package=false 让 uv 只管理依赖，不试图把项目自身安装进 venv
+[tool.uv]
+package = false
