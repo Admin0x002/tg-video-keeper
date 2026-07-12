@@ -1,0 +1,23 @@
+# 敏感文件 —— 绝对不能提交
+.env
+sessions/*.session
+sessions/*.session-journal
+sessions/*.json
+logs/*.log
+logs/*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 保留空目录占位
+!sessions/.gitkeep
+!logs/.gitkeep

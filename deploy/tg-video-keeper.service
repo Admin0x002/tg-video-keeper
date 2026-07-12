@@ -1,0 +1,30 @@
+[Unit]
+Description=tg-video-keeper — 私密 Telegram 媒体克隆守护进程
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ↓↓↓ 按你的实际环境修改以下三行 ↓↓↓
+User=emiya
+WorkingDirectory=/home/emiya/data/workspace/tg-video-keeper
+ExecStart=/home/emiya/data/workspace/tg-video-keeper/.venv/bin/python /home/emiya/data/workspace/tg-video-keeper/keeper.py
+
+# 自动重启：进程异常退出后 5 秒重启
+Restart=always
+RestartSec=5
+
+# 日志输出到 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tg-video-keeper
+
+# 环境变量（如需覆盖 .env，可在此注入；默认读 .env）
+#Environment=LOG_LEVEL=INFO
+
+# 资源限制
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
