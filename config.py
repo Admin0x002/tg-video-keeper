@@ -21,6 +21,14 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # --------------------- 必填项校验 ---------------------
+def _strip_quotes(s: str) -> str:
+    """去除 .env 中可能误加的引号（单引号/双引号）。"""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1]
+    return s
+
+
 def _require(name: str) -> str:
     """读取必填环境变量，缺失即抛错。"""
     v = os.getenv(name)
@@ -28,44 +36,16 @@ def _require(name: str) -> str:
         raise RuntimeError(
             f"缺少必填环境变量 {name}。请执行 `cp .env.example .env` 并填写后再运行。"
         )
-    return v
+    return _strip_quotes(v)
 
 
 API_ID: int = int(_require("API_ID"))
 API_HASH: str = _require("API_HASH")
-TARGET_CHAT_ID: str = _require("TARGET_CHAT_ID")  # 保持字符串，由 Telethon 解析
+TARGET_CHAT_ID: int = int(_require("TARGET_CHAT_ID"))  # 转 int，Telethon 按 ID 查缓存；字符串会被当名称搜索
 
-
-# --------------------- 来源聊天（监听白名单） ---------------------
-def _parse_chat_id(s: str):
-    """把配置项解析为 Telethon 可识别的 chat 标识：数字则转 int，否则保留字符串（'me'=收藏夹）。"""
-    s = s.strip()
-    if not s:
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        return s
-
-
-_source_raw = os.getenv("SOURCE_CHATS", "me")
-SOURCE_CHAT_IDS = [x for x in (_parse_chat_id(s) for s in _source_raw.split(",")) if x is not None]
-if not SOURCE_CHAT_IDS:
-    raise RuntimeError("SOURCE_CHATS 不能为空，至少需要配置一个来源（'me' 或频道 ID）")
-
-# --------------------- 用户白名单 ---------------------
-_allowed_raw = os.getenv("ALLOWED_USER_IDS", "")
-ALLOWED_USER_IDS: set = set()
-for s in _allowed_raw.split(","):
-    s = s.strip()
-    if s:
-        try:
-            ALLOWED_USER_IDS.add(int(s))
-        except ValueError:
-            pass  # 忽略非法值
 
 # --------------------- 行为开关 ---------------------
-# 来源为收藏夹时，克隆后是否删除原转发消息（保持收藏夹干净）
+# 克隆后是否删除收藏夹原消息（保持收藏夹干净）
 DELETE_ORIGINAL_FROM_SAVED: bool = os.getenv("DELETE_ORIGINAL_FROM_SAVED", "true").lower() == "true"
 
 # Session 文件名（不含扩展名，Telethon 自动加 .session）
@@ -84,8 +64,6 @@ def summary() -> str:
         f"API_ID={API_ID}\n"
         f"API_HASH={'***' + API_HASH[-4:] if API_HASH else '(空)'}\n"
         f"TARGET_CHAT_ID={TARGET_CHAT_ID}\n"
-        f"SOURCE_CHAT_IDS={SOURCE_CHAT_IDS}\n"
-        f"ALLOWED_USER_IDS={ALLOWED_USER_IDS or '(不限，依赖来源白名单)'}\n"
         f"DELETE_ORIGINAL_FROM_SAVED={DELETE_ORIGINAL_FROM_SAVED}\n"
         f"SESSION_NAME={SESSION_NAME}\n"
         f"SILENT_SEND={SILENT_SEND}\n"

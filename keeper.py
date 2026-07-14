@@ -4,16 +4,16 @@
 tg-video-keeper — 私密 Telegram 媒体克隆守护进程
 
 =====================================================================
-工作逻辑（务必先读 AGENTS.md §6）
+工作逻辑
 =====================================================================
-1. 监听来源聊天（收藏夹 'me' 和/或私密频道）的新消息。
-2. 检测到媒体（视频/图片/文档/音频）→ 用 send_message(file=msg) 克隆到目标备份频道，
+1. 监听收藏夹（Saved Messages）的新消息。
+2. 检测到媒体（视频/图片/文档/音频）→ 用 send_file(file=msg) 克隆到目标备份频道，
    生成**不带 "转发自" 头部**的独立消息；Telegram 全局去重，原频道被封后备份仍可访问。
-3. 来源=收藏夹 且 DELETE_ORIGINAL_FROM_SAVED=true → 克隆后删除原消息，保持收藏夹干净。
+3. DELETE_ORIGINAL_FROM_SAVED=true → 克隆后删除原消息，保持收藏夹干净。
 4. 相册（同一 grouped_id 的多条媒体）由 events.Album 聚合后整体克隆，
    NewMessage 中按 grouped_id 跳过相册成员，避免重复克隆。
 
-安全：仅处理配置的来源 + 用户白名单，不对外提供任何服务。
+安全：仅监听收藏夹（只有账号本人能发消息），不对外提供任何服务。
 =====================================================================
 """
 from __future__ import annotations
@@ -37,6 +37,7 @@ from telethon.tl.custom import Message
 from telethon.tl.types import MessageMediaEmpty
 
 import config as cfg
+
 
 # =====================================================================
 # 一、日志配置
@@ -92,46 +93,13 @@ def make_client() -> TelegramClient:
 # =====================================================================
 # 三、运行期状态（启动后填充）
 # =====================================================================
-# 目标频道的 InputPeer 缓存（避免每条消息都解析实体）
-TARGET_PEER = None
-# 本人的 user id（用于判定消息是否来自收藏夹）
-MY_USER_ID: Optional[int] = None
-
-
-def _is_from_saved_messages(event_or_chat_id) -> bool:
-    """判定消息来源是否为收藏夹（Saved Messages）。
-
-    Telethon 中，收藏夹对话的 chat_id 等于本人 user id。
-    """
-    if MY_USER_ID is None:
-        return False
-    chat_id = getattr(event_or_chat_id, "chat_id", event_or_chat_id)
-    return chat_id == MY_USER_ID
+TARGET_PEER = None                      # 目标频道实体缓存
+MY_USER_ID: Optional[int] = None        # 本人 user id（用于判定收藏夹）
 
 
 # =====================================================================
-# 四、安全校验
+# 四、工具函数
 # =====================================================================
-def _source_allowed(chat_id) -> bool:
-    """来源聊天是否在白名单内。'me' 收藏夹由 MY_USER_ID 兜底。"""
-    if chat_id is None:
-        return False
-    for sid in cfg.SOURCE_CHAT_IDS:
-        if sid == chat_id:
-            return True
-        # 'me' 在配置中是字符串，实际 chat_id 是本人 user id
-        if sid == "me" and _is_from_saved_messages(chat_id):
-            return True
-    return False
-
-
-def _user_allowed(user_id) -> bool:
-    """发送者是否在用户白名单内。白名单为空时放行（仍受来源白名单保护）。"""
-    if not cfg.ALLOWED_USER_IDS:
-        return True
-    return user_id in cfg.ALLOWED_USER_IDS
-
-
 def _has_media(message: Message) -> bool:
     """消息是否携带媒体（视频/图片/文档/音频等）。纯文本/空媒体返回 False。"""
     return message.media is not None and not isinstance(message.media, MessageMediaEmpty)
@@ -150,9 +118,9 @@ async def clone_single(client: TelegramClient, message: Message) -> bool:
     try:
         sent = await client.send_file(
             TARGET_PEER,
-            file=message,                           # Message 对象 → Telethon 提取媒体
-            caption=message.message,                # 保留原 caption 文本（可为 None）
-            formatting_entities=message.entities,   # 保留原格式化实体（粗体/链接等）
+            file=message,
+            caption=message.message,
+            formatting_entities=message.entities,
             silent=cfg.SILENT_SEND,
         )
         sent_id = getattr(sent, "id", "?")
@@ -162,14 +130,13 @@ async def clone_single(client: TelegramClient, message: Message) -> bool:
         )
         return True
     except FloodWaitError as e:
-        # 必须遵守 Telegram 限流，不可绕过
         log.warning("⚠ 限流，等待 %ss 后重试 (msg_id=%s)", e.seconds, message.id)
         await asyncio.sleep(e.seconds + 1)
         return await clone_single(client, message)
     except RPCError as e:
         log.error("✗ 克隆失败(RPC) msg_id=%s: %s", message.id, e)
         return False
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.exception("✗ 克隆失败(未知) msg_id=%s: %s", message.id, e)
         return False
 
@@ -182,11 +149,10 @@ async def clone_album(client: TelegramClient, messages: List[Message]) -> bool:
         captions = [m.message for m in messages]
         sent = await client.send_file(
             TARGET_PEER,
-            file=messages,                # 消息列表 → 作为相册发送
+            file=messages,
             caption=captions,
             silent=cfg.SILENT_SEND,
         )
-        # 相册返回 list，取首条 id
         first_id = getattr(sent[0], "id", "?") if isinstance(sent, list) else getattr(sent, "id", "?")
         log.info(
             "✓ 相册克隆成功  共 %s 条  首条 src_msg_id=%s → target_msg_id=%s  grouped_id=%s",
@@ -200,34 +166,27 @@ async def clone_album(client: TelegramClient, messages: List[Message]) -> bool:
     except RPCError as e:
         log.error("✗ 相册克隆失败(RPC): %s", e)
         return False
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.exception("✗ 相册克隆失败(未知): %s", e)
         return False
 
 
 # =====================================================================
-# 六、收尾删除（仅收藏夹来源）
+# 六、收尾删除
 # =====================================================================
-async def maybe_delete_originals(
+async def _delete_originals_if_enabled(
     client: TelegramClient,
-    source_chat_id,
     message_ids: List[int],
 ) -> None:
-    """若来源是收藏夹且配置开启删除，则删除原消息。
-
-    私密频道来源保留原消息（用户未要求删除）。
-    """
+    """DELETE_ORIGINAL_FROM_SAVED=true 时删除收藏夹原消息。"""
     if not cfg.DELETE_ORIGINAL_FROM_SAVED:
         return
-    if not _is_from_saved_messages(source_chat_id):
-        return
     try:
-        # 删除收藏夹中的消息；收藏夹实体用 'me'
         await client.delete_messages("me", message_ids)
         log.info("✓ 已删除收藏夹原消息  ids=%s", message_ids)
     except RPCError as e:
         log.error("✗ 删除原消息失败(RPC) ids=%s: %s", message_ids, e)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.exception("✗ 删除原消息失败(未知) ids=%s: %s", message_ids, e)
 
 
@@ -235,19 +194,12 @@ async def maybe_delete_originals(
 # 七、事件处理器注册
 # =====================================================================
 def register_handlers(client: TelegramClient) -> None:
-    """注册 NewMessage + Album 事件处理器。"""
+    """注册 NewMessage + Album 事件处理器（仅监听收藏夹）。"""
 
-    @client.on(events.NewMessage(chats=cfg.SOURCE_CHAT_IDS, incoming=True))
-    async def on_new_message(event):  # noqa: ANN001
+    @client.on(events.NewMessage(chats=["me"], incoming=True))
+    async def on_new_message(event):
         """处理单条新消息。相册成员跳过（交给 Album 处理）。"""
         msg: Message = event.message
-
-        # 安全校验
-        if not _source_allowed(event.chat_id):
-            return
-        if not _user_allowed(event.from_id):
-            log.warning("⚠ 拒绝非白名单用户: from_id=%s", event.from_id)
-            return
 
         # 相册成员跳过（避免与 Album 重复克隆）
         if msg.grouped_id is not None:
@@ -260,31 +212,27 @@ def register_handlers(client: TelegramClient) -> None:
             log.debug("跳过无媒体消息 msg_id=%s", msg.id)
             return
 
-        log.info("▶ 收到单条媒体 msg_id=%s chat=%s media=%s",
-                 msg.id, event.chat_id, type(msg.media).__name__)
+        log.info("▶ 收到单条媒体 msg_id=%s media=%s",
+                 msg.id, type(msg.media).__name__)
 
         ok = await clone_single(client, msg)
         if ok:
-            await maybe_delete_originals(client, event.chat_id, [msg.id])
+            await _delete_originals_if_enabled(client, [msg.id])
 
-    @client.on(events.Album(chats=cfg.SOURCE_CHAT_IDS))
-    async def on_album(event):  # noqa: ANN001
+    @client.on(events.Album(chats=["me"]))
+    async def on_album(event):
         """处理相册：聚合多条 grouped_id 相同的媒体，整体克隆。"""
         msgs: List[Message] = event.messages
-
-        # 安全校验（相册事件取首条消息的来源）
         if not msgs:
             return
-        if not _source_allowed(msgs[0].chat_id):
-            return
 
-        log.info("▶ 收到相album 共 %s 条 grouped_id=%s",
+        log.info("▶ 收到相册 共 %s 条 grouped_id=%s",
                  len(msgs), msgs[0].grouped_id)
 
         ok = await clone_album(client, msgs)
         if ok:
             ids = [m.id for m in msgs]
-            await maybe_delete_originals(client, msgs[0].chat_id, ids)
+            await _delete_originals_if_enabled(client, ids)
 
 
 # =====================================================================
@@ -294,15 +242,32 @@ async def init_state(client: TelegramClient) -> None:
     """启动后填充运行期状态：解析目标实体、获取本人 user id。"""
     global TARGET_PEER, MY_USER_ID
 
-    # 解析目标频道为 InputPeer 并缓存（后续发送不再重复解析）
-    TARGET_PEER = await client.get_input_entity(cfg.TARGET_CHAT_ID)
+    target_id = cfg.TARGET_CHAT_ID
+    try:
+        TARGET_PEER = await client.get_entity(target_id)
+    except ValueError:
+        log.info("本地缓存中未找到目标频道，正在同步对话列表...")
+        await client.get_dialogs(limit=100)
+        try:
+            TARGET_PEER = await client.get_entity(target_id)
+        except ValueError as e:
+            log.critical(
+                "✗ 无法解析目标频道 '%s'。\n"
+                "  可能原因：\n"
+                "  1. 当前账号尚未加入该频道 — 请在 Telegram 客户端中搜索并加入\n"
+                "  2. Chat ID 不正确 — 尝试用 @userinfobot 获取正确的 ID\n"
+                "  3. .env 中 TARGET_CHAT_ID 误加了引号 — 去掉引号，直接写值\n"
+                "  4. Session 过期 — 删除 sessions/ 目录下的 .session 文件后重新登录\n"
+                "  原始错误: %s",
+                target_id, e,
+            )
+            raise
     log.info("目标备份频道已解析: %s", TARGET_PEER)
 
     me = await client.get_me()
     MY_USER_ID = me.id
     log.info("当前账号: id=%s username=%s name=%s",
              me.id, me.username, f"{me.first_name or ''} {me.last_name or ''}".strip())
-    log.info("收藏夹(Saved Messages) chat_id = %s", MY_USER_ID)
 
 
 async def run() -> None:
@@ -313,21 +278,18 @@ async def run() -> None:
     log.info("=" * 60)
 
     client = make_client()
-
-    # 首次运行会交互式要求输入手机号 + 验证码；后续自动用 session 文件
     await client.start()
     log.info("✓ Telegram 登录成功")
 
     await init_state(client)
     register_handlers(client)
 
-    log.info("✓ 已注册事件处理器，开始监听来源聊天: %s", cfg.SOURCE_CHAT_IDS)
+    log.info("✓ 已注册事件处理器，开始监听收藏夹")
     log.info("  - 单条媒体: NewMessage")
     log.info("  - 相册:     Album")
-    log.info("  - 收藏夹来源自动删除原消息: %s", cfg.DELETE_ORIGINAL_FROM_SAVED)
+    log.info("  - 克隆后删除原消息: %s", cfg.DELETE_ORIGINAL_FROM_SAVED)
     log.info("守护进程运行中，按 Ctrl+C 退出...")
 
-    # run_until_disconnected 阻塞直到断开；auto_reconnect 会自动处理临时断线
     await client.run_until_disconnected()
 
 
@@ -345,18 +307,15 @@ async def run_with_reconnect() -> None:
     for attempt in range(1, max_attempts + 1):
         try:
             await run()
-            # 正常退出（如收到停止信号）
             log.info("客户端已正常断开，退出。")
             return
         except (AuthKeyError, UserDeactivatedError) as e:
-            # 不可恢复：session 失效或账号被封
             log.critical("✗ 不可恢复的认证错误，停止重试: %s", e)
             raise
         except KeyboardInterrupt:
             log.info("收到中断信号，退出。")
             return
-        except Exception as e:  # noqa: BLE001
-            # 可恢复异常：指数退避重试
+        except Exception as e:
             wait = min(2 ** attempt, 60)
             log.warning(
                 "✗ 第 %s/%s 次运行异常: %s，%ss 后重试",
@@ -401,12 +360,8 @@ async def cmd_login() -> None:
 # =====================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(description="tg-video-keeper 私密媒体克隆守护进程")
-    parser.add_argument(
-        "--login", action="store_true", help="首次登录，生成 session 文件"
-    )
-    parser.add_argument(
-        "--check", action="store_true", help="健康检查：打印账号 + 配置，不监听"
-    )
+    parser.add_argument("--login", action="store_true", help="首次登录，生成 session 文件")
+    parser.add_argument("--check", action="store_true", help="健康检查：打印账号 + 配置，不监听")
     args = parser.parse_args()
 
     try:
@@ -422,7 +377,6 @@ def main() -> None:
         log.critical("✗ 账号认证失败，无法继续: %s", e)
         sys.exit(2)
     except RuntimeError as e:
-        # 配置缺失等
         log.critical("✗ 启动失败: %s", e)
         sys.exit(1)
 

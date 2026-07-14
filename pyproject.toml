@@ -1,7 +1,7 @@
 [project]
 name = "tg-video-keeper"
 version = "0.1.0"
-description = "私密 Telegram 媒体克隆守护进程 — 监控收藏夹/私密频道，克隆媒体到备份频道"
+description = "私密 Telegram 媒体克隆守护进程 — 监控收藏夹，克隆媒体到备份频道"
 requires-python = ">=3.11"
 dependencies = [
     "telethon==1.44.0",

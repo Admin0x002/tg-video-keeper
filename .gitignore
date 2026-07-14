@@ -17,6 +17,7 @@ venv/
 # 系统
 .DS_Store
 Thumbs.db
+.idea
 
 # 保留空目录占位
 !sessions/.gitkeep
