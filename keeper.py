@@ -355,6 +355,110 @@ async def cmd_login() -> None:
     await client.disconnect()
 
 
+async def cmd_clean_forwards(limit: Optional[int] = None,
+                            reverse: bool = False) -> None:
+    """清洗目标频道中的转发消息：将转发来的媒体/文本重新上传为自主消息。
+
+    原理：遍历频道消息，检测 fwd_from（转发标记），
+    对媒体消息用 send_file(file=msg) 引用原文件重新发送，
+    对文本消息用 send_message 重新发送，然后删除原转发。
+    """
+    client = make_client()
+    await client.start()
+    await init_state(client)
+
+    entity = TARGET_PEER
+
+    log.info("=" * 60)
+    log.info("清洗转发消息 — 目标频道: %s", cfg.TARGET_CHAT_ID)
+    if limit:
+        log.info("（限制: 最多 %s 条）", limit)
+    log.info("（顺序: %s）", "从旧到新" if reverse else "从新到旧")
+    log.info("=" * 60)
+
+    # 第一步：扫描，收集所有转发消息的 ID 和类型
+    log.info("正在扫描频道中的转发消息...")
+    fwd_items = []  # [(msg_id, has_media), ...]
+    async for msg in client.iter_messages(entity, limit=limit, reverse=reverse):
+        if msg.fwd_from is not None:
+            fwd_items.append((msg.id, _has_media(msg)))
+
+    total = len(fwd_items)
+    if total == 0:
+        log.info("未发现转发消息，无需清洗。")
+        await client.disconnect()
+        return
+    log.info("发现 %s 条转发消息，开始逐条清洗（间隔 2s）...", total)
+
+    # 第二步：逐条处理
+    processed = 0
+    failed = 0
+    delay = 2  # 每条间隔秒数，防止触发风控
+
+    for msg_id, has_media in fwd_items:
+        # 重新获取最新消息对象（file_reference 可能已变化）
+        msg = await client.get_messages(entity, ids=msg_id)
+        if not msg:
+            log.warning("[SKIP] [%s] 消息已不存在", msg_id)
+            continue
+
+        if has_media:
+            try:
+                sent = await client.send_file(
+                    entity,
+                    file=msg,
+                    caption=msg.message,
+                    formatting_entities=msg.entities,
+                    silent=True,
+                )
+                sent_id = getattr(sent, "id", "?")
+                await client.delete_messages(entity, [msg_id])
+                processed += 1
+                log.info("[OK] [%s/%s] [%s] -> [%s] (%s)",
+                         processed, total, msg_id, sent_id,
+                         type(msg.media).__name__)
+            except FloodWaitError as e:
+                log.warning("[WARN] 限流 %ss，等待...", e.seconds)
+                await asyncio.sleep(e.seconds + 1)
+                try:
+                    sent = await client.send_file(
+                        entity, file=msg, caption=msg.message,
+                        formatting_entities=msg.entities, silent=True,
+                    )
+                    await client.delete_messages(entity, [msg_id])
+                    processed += 1
+                    log.info("[OK] [%s/%s] [%s] 重试成功", processed, total, msg_id)
+                except RPCError as e2:
+                    failed += 1
+                    log.error("[FAIL] [%s] 重试也失败: %s", msg_id, e2)
+            except RPCError as e:
+                failed += 1
+                log.error("[FAIL] [%s] 处理失败: %s", msg_id, e)
+        else:
+            try:
+                await client.send_message(
+                    entity,
+                    message=msg.message or "",
+                    formatting_entities=msg.entities,
+                    silent=True,
+                )
+                await client.delete_messages(entity, [msg_id])
+                processed += 1
+                log.info("[OK] [%s/%s] [%s] 文本转发已清洗",
+                         processed, total, msg_id)
+            except RPCError as e:
+                failed += 1
+                log.error("[FAIL] [%s] 文本清洗失败: %s", msg_id, e)
+
+        await asyncio.sleep(delay)
+
+    log.info("=" * 60)
+    log.info("清洗完成: 处理 %s / 失败 %s / 总计 %s",
+             processed, failed, total)
+
+    await client.disconnect()
+
+
 # =====================================================================
 # 十一、入口
 # =====================================================================
@@ -362,6 +466,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="tg-video-keeper 私密媒体克隆守护进程")
     parser.add_argument("--login", action="store_true", help="首次登录，生成 session 文件")
     parser.add_argument("--check", action="store_true", help="健康检查：打印账号 + 配置，不监听")
+    parser.add_argument("--clean-forwards", action="store_true",
+                        help="清洗目标频道中的转发消息，重新上传为自主消息")
+    parser.add_argument("--limit", type=int, default=None, metavar="N",
+                        help="配合 --clean-forwards，限制最多处理 N 条消息")
+    parser.add_argument("--reverse", action="store_true",
+                        help="配合 --clean-forwards，从旧到新处理（默认从新到旧）")
     args = parser.parse_args()
 
     try:
@@ -369,6 +479,12 @@ def main() -> None:
             asyncio.run(cmd_login())
         elif args.check:
             asyncio.run(cmd_check())
+        elif args.clean_forwards:
+            if args.limit:
+                log.info("启用限制模式：最多处理 %s 条", args.limit)
+            asyncio.run(cmd_clean_forwards(
+                limit=args.limit, reverse=args.reverse,
+            ))
         else:
             asyncio.run(run_with_reconnect())
     except KeyboardInterrupt:
