@@ -22,9 +22,13 @@ import argparse
 import asyncio
 import logging
 import os
+import re
+import shutil
 import sys
+import time
 from logging.handlers import RotatingFileHandler
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
+from urllib.parse import parse_qs, urlparse
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -34,8 +38,9 @@ from telethon.errors import (
     UserDeactivatedError,
 )
 from telethon.tl.custom import Message
-from telethon.tl.types import MessageMediaEmpty
+from telethon.tl.types import MessageMediaEmpty, MessageMediaWebPage
 
+import compress as cmp
 import config as cfg
 
 
@@ -101,8 +106,127 @@ MY_USER_ID: Optional[int] = None        # 本人 user id（用于判定收藏夹
 # 四、工具函数
 # =====================================================================
 def _has_media(message: Message) -> bool:
-    """消息是否携带媒体（视频/图片/文档/音频等）。纯文本/空媒体返回 False。"""
-    return message.media is not None and not isinstance(message.media, MessageMediaEmpty)
+    """消息是否携带可克隆媒体（视频/图片/文档/音频等）。
+
+    排除空媒体与链接预览(WebPage)：WebPage 预览不是真实文件，
+    send_file(file=msg) 无法克隆，应按文本处理或走链接流程。
+    """
+    if message.media is None or isinstance(message.media, (MessageMediaEmpty, MessageMediaWebPage)):
+        return False
+    return True
+
+
+# =====================================================================
+# 四之二、收藏夹链接解析
+# =====================================================================
+# 匹配 t.me / telegram.me 的消息链接（不含 scheme 也行），取路径部分解析。
+_TME_URL_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me)/[^\s]+", re.IGNORECASE)
+# 匹配 tg:// 自定义 scheme（resolve / privatepost）。
+_TG_SCHEME_RE = re.compile(r"tg://(?:resolve|privatepost)\?[^\s]+", re.IGNORECASE)
+
+# 私有频道/超级群 marked peer id 的前缀偏移：marked = -(10**12) - channel_id。
+# t.me/c/<channel_id>/<msg> 中的 channel_id 是原始 id，需用此公式转成 Telethon 的负 id。
+_CHANNEL_MARK_OFFSET = 10 ** 12
+
+
+def parse_tg_link(text: str) -> Optional[Tuple[Union[str, int], int]]:
+    """从文本中提取第一条 Telegram 消息分享链接，解析为 (peer, msg_id)。
+
+    支持：
+      - 公开： https://t.me/<username>/<msg_id>
+      - 私有： https://t.me/c/<channel_id>/<msg_id>（带话题时末段为 msg_id）
+      - tg://resolve?domain=<username>&post=<msg_id>
+      - tg://privatepost?channel=<channel_id>&post=<msg_id>
+
+    解析失败/无链接返回 None。peer 为 username(str) 或负数 channel id(int)。
+    """
+    if not text:
+        return None
+
+    m = _TME_URL_RE.search(text)
+    if m:
+        return _parse_tme_url(m.group(0))
+
+    m = _TG_SCHEME_RE.search(text)
+    if m:
+        return _parse_tg_scheme(m.group(0))
+
+    return None
+
+
+def _parse_tme_url(url: str) -> Optional[Tuple[Union[str, int], int]]:
+    """解析 t.me/telegram.me 链接。"""
+    # 去掉 query（?single / ?comment=... 等）
+    path = url.split("?", 1)[0]
+    m = re.search(r"(?:t\.me|telegram\.me)/(.+)$", path, re.IGNORECASE)
+    if not m:
+        return None
+    parts = [p for p in m.group(1).split("/") if p]
+    if not parts:
+        return None
+
+    if parts[0] == "c":
+        # 私有：/c/<channel_id>/<msg_id> 或 /c/<channel_id>/<topic_id>/<msg_id>
+        nums = [p for p in parts[1:] if p.isdigit()]
+        if len(nums) < 2:
+            return None
+        channel_id = int(nums[0])
+        msg_id = int(nums[-1])
+        return (-_CHANNEL_MARK_OFFSET - channel_id, msg_id)
+
+    # 公开：/<username>/<msg_id>
+    if len(parts) < 2 or not parts[1].isdigit():
+        return None
+    username = parts[0]
+    if username.lower() in ("joinchat", "addstickers", "share", "join"):
+        # 这些是邀请/分享链接，不是消息链接
+        return None
+    return (username, int(parts[1]))
+
+
+def _parse_tg_scheme(url: str) -> Optional[Tuple[Union[str, int], int]]:
+    """解析 tg://resolve / tg://privatepost 链接。"""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    post = (qs.get("post") or [None])[0]
+    if not post or not post.isdigit():
+        return None
+
+    if parsed.netloc.lower() == "resolve":
+        domain = (qs.get("domain") or [None])[0]
+        if not domain:
+            return None
+        return (domain, int(post))
+    if parsed.netloc.lower() == "privatepost":
+        channel = (qs.get("channel") or [None])[0]
+        if not channel or not channel.isdigit():
+            return None
+        return (-_CHANNEL_MARK_OFFSET - int(channel), int(post))
+    return None
+
+
+def contains_tg_link(text: str) -> bool:
+    """文本是否包含可解析的 Telegram 消息分享链接。"""
+    return parse_tg_link(text) is not None
+
+
+def _short_title(msg: Message) -> str:
+    """进度消息用的短标题：取文件名/caption 前 6 字符，折叠换行与多余空白。
+
+    原始名称过长或含换行会撑破进度消息排版，故统一截断到 6 字符。
+    """
+    name = ""
+    try:
+        if getattr(msg, "file", None) is not None and msg.file.name:
+            name = msg.file.name
+    except Exception:
+        name = ""
+    if not name:
+        name = msg.message or ""
+    if not name:
+        name = type(msg.media).__name__
+    name = " ".join(str(name).split())  # 折叠所有空白(含换行)为单空格
+    return name[:6]
 
 
 # =====================================================================
@@ -172,6 +296,511 @@ async def clone_album(client: TelegramClient, messages: List[Message]) -> bool:
 
 
 # =====================================================================
+# 五之二、收藏夹链接 → 下载 → 上传
+# =====================================================================
+async def _resolve_source_message(
+    client: TelegramClient,
+    parsed: Tuple[Union[str, int], int],
+) -> Optional[Message]:
+    """根据 parse_tg_link 的结果，拉取指向的源消息对象。
+
+    返回 None 表示：非成员/链接失效/无媒体/属相册（v1 不处理）。
+    """
+    peer, msg_id = parsed
+    try:
+        msg = await client.get_messages(peer, ids=msg_id)
+    except ValueError:
+        log.warning("✗ 无法解析频道实体（可能未加入该频道或为私有频道），跳过: peer=%s", peer)
+        return None
+    except RPCError as e:
+        log.error("✗ get_messages 失败 peer=%s msg_id=%s: %s", peer, msg_id, e)
+        return None
+
+    if not msg:
+        log.warning("✗ 源消息不存在或不可访问 peer=%s msg_id=%s", peer, msg_id)
+        return None
+    if not _has_media(msg):
+        log.info("跳过：源消息无媒体 peer=%s msg_id=%s", peer, msg_id)
+        return None
+    return msg
+
+
+class SavedMessagesProgress:
+    """收藏夹进度消息：发一条、节流编辑、完成后删除。
+
+    bot 自己发出的消息是 outgoing，不会被 incoming=True 的处理器重复触发，
+    无回环风险。编辑节流(MIN_EDIT_INTERVAL)避免触发 Telegram 编辑限流。
+    report() 从同步进度回调调用，内部用 asyncio.create_task 调度异步编辑。
+    """
+
+    MIN_EDIT_INTERVAL = 2.5  # 秒，同一消息两次编辑的最小间隔
+
+    def __init__(self, client: TelegramClient, chat: str = "me"):
+        self._client = client
+        self._chat = chat
+        self.msg_id: Optional[int] = None
+        self._last_edit = 0.0
+        self._last_pct = -1
+
+    async def send(self, text: str) -> None:
+        try:
+            m = await self._client.send_message(self._chat, text)
+            self.msg_id = getattr(m, "id", None)
+        except Exception as e:
+            log.debug("进度消息发送失败(忽略): %s", e)
+
+    def report(self, label: str, pct: Optional[int] = None,
+               received_mb: Optional[float] = None,
+               total_mb: Optional[float] = None) -> None:
+        """同步进度回调入口：节流后调度一次异步编辑。"""
+        now = time.monotonic()
+        if pct is not None and pct < 100 and pct < self._last_pct + 5 \
+                and now - self._last_edit < self.MIN_EDIT_INTERVAL:
+            return
+        if pct is None and now - self._last_edit < self.MIN_EDIT_INTERVAL:
+            return
+        text = self._format(label, pct, received_mb, total_mb)
+        self._last_edit = now
+        if pct is not None:
+            self._last_pct = pct
+        try:
+            asyncio.create_task(self._edit(text))
+        except RuntimeError:
+            pass  # 无运行中的事件循环(忽略)
+
+    async def set_text(self, text: str) -> None:
+        """立即(不节流)更新文本，用于阶段切换(下载→压缩→上传)。"""
+        self._last_edit = time.monotonic()
+        await self._edit(text)
+
+    def reset(self) -> None:
+        """重置节流状态(每个新文件下载前调用,避免上一个文件 100% 卡住下一个)。"""
+        self._last_edit = 0.0
+        self._last_pct = -1
+
+    async def _edit(self, text: str) -> None:
+        if not self.msg_id:
+            return
+        try:
+            await self._client.edit_message(self._chat, self.msg_id, text)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds + 1)
+            try:
+                await self._client.edit_message(self._chat, self.msg_id, text)
+            except Exception:
+                pass
+        except Exception as e:
+            log.debug("进度消息编辑失败(忽略): %s", e)
+
+    async def delete(self) -> None:
+        if not self.msg_id:
+            return
+        try:
+            await self._client.delete_messages(self._chat, [self.msg_id])
+        except Exception as e:
+            log.debug("进度消息删除失败(忽略): %s", e)
+        self.msg_id = None
+
+    @staticmethod
+    def _format(label: str, pct: Optional[int],
+                received_mb: Optional[float], total_mb: Optional[float]) -> str:
+        if pct is not None and received_mb is not None and total_mb is not None:
+            return f"{label} {pct}% ({received_mb:.1f}/{total_mb:.1f}MB)"
+        if pct is not None:
+            return f"{label} {pct}%"
+        if received_mb is not None and total_mb is not None:
+            return f"{label} ({received_mb:.1f}/{total_mb:.1f}MB)"
+        return label
+
+
+async def _download_to_dir(
+    client: TelegramClient,
+    msg: Message,
+    sub_dir: str,
+    progress_sink: Optional[SavedMessagesProgress] = None,
+    progress_label: str = "⏳ 下载中",
+) -> Optional[str]:
+    """下载单条消息媒体到 downloads 子目录，返回本地文件路径。
+
+    双超时保护（避免受限频道挂起时白等、又让大文件慢链路能下完）：
+      - LINK_STALL_TIMEOUT：进度回调超过此秒无任何进展 → 判定挂起/断流，取消。
+        受限频道(noforwards)的 download_media 进度回调永不触发，靠此快速跳出。
+      - LINK_DOWNLOAD_TIMEOUT：整体最大时长兜底。
+    进度回调每收 5% 打一行，便于区分"在下载只是慢"与"挂起"。
+    成功返回路径，失败/超时返回 None。
+    """
+    os.makedirs(sub_dir, exist_ok=True)
+    state = {"last_progress": time.monotonic(), "pct": -1, "got_bytes": False}
+
+    def _progress(received: int, total: int) -> None:
+        state["last_progress"] = time.monotonic()
+        state["got_bytes"] = True
+        if total > 0:
+            pct = int(received * 100 / total)
+            if pct >= state["pct"] + 5 or pct == 100:
+                state["pct"] = pct
+                log.info("… 下载中 %s%% (%.1f/%.1f MB) msg_id=%s",
+                         pct, received / 1048576, total / 1048576, msg.id)
+            if progress_sink is not None:
+                progress_sink.report(progress_label, pct=pct,
+                                     received_mb=received / 1048576,
+                                     total_mb=total / 1048576)
+        elif received > 0:
+            if received % (10 * 1048576) < 1024 * 1024:
+                log.info("… 下载中(总大小未知)已收 %.1f MB msg_id=%s",
+                         received / 1048576, msg.id)
+            if progress_sink is not None:
+                progress_sink.report(progress_label, pct=None,
+                                     received_mb=received / 1048576, total_mb=0)
+
+    task = asyncio.create_task(
+        client.download_media(msg, file=sub_dir, progress_callback=_progress)
+    )
+    start = time.monotonic()
+    max_timeout = cfg.LINK_DOWNLOAD_TIMEOUT
+    stall_timeout = cfg.LINK_STALL_TIMEOUT
+    try:
+        while True:
+            try:
+                # 每 5s 醒来检查停滞；shield 保证超时不取消底层下载任务
+                path = await asyncio.wait_for(asyncio.shield(task), timeout=5)
+                break
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            if now - state["last_progress"] > stall_timeout:
+                task.cancel()
+                if state["got_bytes"]:
+                    log.warning(
+                        "⚠ 下载停滞(有进度后 %ss 无进展),取消 msg_id=%s "
+                        "进度=%s%%(网络中断?可重试)",
+                        stall_timeout, msg.id, state["pct"],
+                    )
+                else:
+                    log.warning(
+                        "⚠ 进度回调从未触发,疑似受限频道(noforwards)MTProto "
+                        "upload.getFile 被服务端挂起,取消 msg_id=%s", msg.id,
+                    )
+                _cleanup_dir(sub_dir)
+                return None
+            if now - start > max_timeout:
+                task.cancel()
+                log.warning(
+                    "⚠ 下载超过最大时长 %ss,取消 msg_id=%s 进度=%s%%",
+                    max_timeout, msg.id, state["pct"],
+                )
+                _cleanup_dir(sub_dir)
+                return None
+
+        if not path:
+            log.warning("✗ 下载未产生文件 msg_id=%s", msg.id)
+            _cleanup_dir(sub_dir)
+            return None
+        return path
+    except FloodWaitError as e:
+        log.warning("⚠ 下载限流 %ss,等待后重试 msg_id=%s", e.seconds, msg.id)
+        await asyncio.sleep(e.seconds + 1)
+        return await _download_to_dir(client, msg, sub_dir)
+    except RPCError as e:
+        log.error("✗ 下载失败(RPC) msg_id=%s: %s", msg.id, e)
+        _cleanup_dir(sub_dir)
+        return None
+    except Exception as e:
+        log.exception("✗ 下载失败(未知) msg_id=%s: %s", msg.id, e)
+        _cleanup_dir(sub_dir)
+        return None
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+async def _send_local_file(
+    client: TelegramClient,
+    file_path: str,
+    src_msg: Message,
+    progress_sink: Optional[SavedMessagesProgress] = None,
+) -> bool:
+    """把本地下载好的文件上传到目标备份频道，不带转发头。"""
+    def _upload_progress(sent: int, total: int) -> None:
+        if progress_sink is not None and total > 0:
+            pct = int(sent * 100 / total)
+            progress_sink.report("⏳ 上传中", pct=pct,
+                                 received_mb=sent / 1048576,
+                                 total_mb=total / 1048576)
+
+    try:
+        sent = await client.send_file(
+            TARGET_PEER,
+            file=file_path,
+            caption=src_msg.message,
+            formatting_entities=src_msg.entities,
+            silent=cfg.SILENT_SEND,
+            progress_callback=_upload_progress,
+        )
+        sent_id = getattr(sent, "id", "?")
+        log.info(
+            "✓ 链接内容已上传  src_msg_id=%s → target_msg_id=%s  file=%s  media=%s",
+            src_msg.id, sent_id, os.path.basename(file_path),
+            type(src_msg.media).__name__,
+        )
+        return True
+    except FloodWaitError as e:
+        log.warning("⚠ 上传限流 %ss，等待后重试 msg_id=%s", e.seconds, src_msg.id)
+        await asyncio.sleep(e.seconds + 1)
+        return await _send_local_file(client, file_path, src_msg)
+    except RPCError as e:
+        log.error("✗ 上传失败(RPC) msg_id=%s: %s", src_msg.id, e)
+        return False
+    except Exception as e:
+        log.exception("✗ 上传失败(未知) msg_id=%s: %s", src_msg.id, e)
+        return False
+
+
+def _cleanup_dir(path: str) -> None:
+    """删除下载子目录及其内容（已上传或失败后回收）。"""
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        log.debug("清理目录失败（忽略）: %s", path)
+
+
+def _safe_remove(path: str) -> None:
+    """安全删除单个文件（忽略错误）。"""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        log.debug("删除文件失败（忽略）: %s", path)
+
+
+async def _maybe_compress(
+    path: str,
+    msg: Message,
+    progress_sink: Optional[SavedMessagesProgress] = None,
+) -> str:
+    """按"码率=大小/时长"判断是否压缩；需要则 ffmpeg 转码。
+
+    返回最终要上传的路径（压缩后的或原文件）。压缩失败/未变小/无需压缩 → 原文件。
+    ffmpeg 在线程池运行（asyncio.to_thread），不阻塞事件循环。
+    """
+    if not cfg.COMPRESS_VIDEO:
+        return path
+
+    probe = cmp.probe_media(path)
+    if probe is None:
+        log.warning("跳过压缩：ffprobe 失败，上传原文件 msg_id=%s", msg.id)
+        return path
+
+    if not cmp.should_compress(probe):
+        log.info(
+            "跳过压缩(%s) msg_id=%s 大小=%.1fMB 时长=%.1fs 码率=%.1fMbps",
+            cmp.skip_reason(probe), msg.id,
+            probe.size_bytes / 1048576, probe.duration,
+            cmp.source_bitrate_mbps(probe),
+        )
+        return path
+
+    dst = f"{os.path.splitext(path)[0]}_compressed.mp4"
+    if progress_sink is not None:
+        await progress_sink.set_text("⏳ 正在压缩...")
+    log.info(
+        "▶ 开始压缩 msg_id=%s 源=%.1fMB/%.1fs(%.1fMbps) %dx%d → "
+        "CRF%s maxrate=%s preset=%s",
+        msg.id, probe.size_bytes / 1048576, probe.duration,
+        cmp.source_bitrate_mbps(probe), probe.width, probe.height,
+        cfg.COMPRESS_CRF, cfg.COMPRESS_MAXRATE, cfg.COMPRESS_PRESET,
+    )
+    ok = await asyncio.to_thread(
+        cmp.compress_video, path, dst,
+        log_fn=lambda m: log.info("  ffmpeg: %s", m),
+    )
+    if not ok or not os.path.exists(dst):
+        log.warning("✗ 压缩失败，上传原文件 msg_id=%s", msg.id)
+        _safe_remove(dst)
+        return path
+
+    orig_size = os.path.getsize(path)
+    new_size = os.path.getsize(dst)
+    if new_size >= orig_size:
+        log.info(
+            "压缩后未变小(%.1fMB → %.1fMB)，保留原文件 msg_id=%s",
+            orig_size / 1048576, new_size / 1048576, msg.id,
+        )
+        _safe_remove(dst)
+        return path
+    log.info(
+        "✓ 压缩成功 %.1fMB → %.1fMB(-%d%%) msg_id=%s",
+        orig_size / 1048576, new_size / 1048576,
+        int((1 - new_size / orig_size) * 100), msg.id,
+    )
+    return dst
+
+
+async def _fetch_album_members(
+    client: TelegramClient,
+    peer: Union[str, int],
+    base_msg: Message,
+) -> List[Message]:
+    """取与 base_msg 同 grouped_id 的相册全部成员(按 id 升序)。
+
+    相册成员 id 通常连续,在 base 附近 ±50 窗口内扫描即可覆盖(相册最多 10 条)。
+    """
+    gid = base_msg.grouped_id
+    base_id = base_msg.id
+    members: List[Message] = []
+    try:
+        async for m in client.iter_messages(peer, min_id=base_id - 50, max_id=base_id + 50):
+            if m.grouped_id == gid and _has_media(m):
+                members.append(m)
+    except (ValueError, RPCError) as e:
+        log.warning("⚠ 拉取相册成员失败 peer=%s: %s", peer, e)
+        return [base_msg] if _has_media(base_msg) else []
+    members.sort(key=lambda x: x.id)
+    if not members:  # 找不到邻居至少用 base
+        members = [base_msg]
+    return members
+
+
+async def _send_album(
+    client: TelegramClient,
+    paths: List[str],
+    src_msgs: List[Message],
+    progress_sink: Optional[SavedMessagesProgress] = None,
+) -> bool:
+    """把多个本地文件作为相册整体上传到目标频道。"""
+    captions = [m.message or "" for m in src_msgs]
+
+    def _upload_progress(sent: int, total: int) -> None:
+        if progress_sink is not None and total > 0:
+            progress_sink.report("⏳ 上传相册", pct=int(sent * 100 / total),
+                                 received_mb=sent / 1048576, total_mb=total / 1048576)
+
+    try:
+        sent = await client.send_file(
+            TARGET_PEER,
+            file=paths,
+            caption=captions,
+            silent=cfg.SILENT_SEND,
+            progress_callback=_upload_progress,
+        )
+        first_id = getattr(sent[0], "id", "?") if isinstance(sent, list) else getattr(sent, "id", "?")
+        log.info("✓ 相册链接内容已上传  共 %s 条  首条 → target_msg_id=%s",
+                 len(paths), first_id)
+        return True
+    except FloodWaitError as e:
+        log.warning("⚠ 相册上传限流 %ss，等待后重试", e.seconds)
+        await asyncio.sleep(e.seconds + 1)
+        return await _send_album(client, paths, src_msgs, progress_sink)
+    except RPCError as e:
+        log.error("✗ 相册上传失败(RPC): %s", e)
+        return False
+    except Exception as e:
+        log.exception("✗ 相册上传失败(未知): %s", e)
+        return False
+
+
+async def process_album_link(
+    client: TelegramClient,
+    parsed: Tuple[Union[str, int], int],
+    base_msg: Message,
+) -> bool:
+    """相册链接流程：拉取相册全部成员 → 逐条下载(可选压缩) → 作为相册上传。"""
+    peer, _ = parsed
+    members = await _fetch_album_members(client, peer, base_msg)
+    n = len(members)
+    log.info("▶ 相册链接  grouped_id=%s 共 %s 条 peer=%s", base_msg.grouped_id, n, peer)
+
+    progress = SavedMessagesProgress(client)
+    await progress.send(f"⏳ 准备下载相册({n}条)")
+
+    sub_dir = os.path.join(cfg.DOWNLOADS_DIR, f"album_{peer}_{base_msg.id}")
+    final_paths: List[str] = []
+    final_msgs: List[Message] = []
+    try:
+        for i, m in enumerate(members, 1):
+            await progress.set_text(f"⏳ 下载相册 {i}/{n}")
+            progress.reset()
+            one_dir = os.path.join(sub_dir, str(m.id))
+            label = f"⏳ 下载相册 {i}/{n}"
+            path = await _download_to_dir(
+                client, m, one_dir, progress_sink=progress, progress_label=label,
+            )
+            if not path:
+                log.warning("✗ 相册第 %s/%s 条下载失败,跳过 msg_id=%s", i, n, m.id)
+                continue
+            final_path = await _maybe_compress(path, m, progress_sink=progress)
+            final_paths.append(final_path)
+            final_msgs.append(m)
+
+        if not final_paths:
+            await progress.set_text("✗ 相册全部下载失败,原链接已保留")
+            return False
+
+        await progress.set_text("⏳ 正在上传相册...")
+        ok = await _send_album(client, final_paths, final_msgs, progress_sink=progress)
+        if ok:
+            await progress.delete()
+        else:
+            await progress.set_text("✗ 相册上传失败,原链接已保留")
+        return ok
+    finally:
+        for p in final_paths:
+            _safe_remove(p)
+        _cleanup_dir(sub_dir)
+
+
+async def process_link(
+    client: TelegramClient,
+    parsed: Tuple[Union[str, int], int],
+) -> bool:
+    """收藏夹链接 → 解析源消息 → 下载到本地 → 上传到目标频道。
+
+    成功返回 True。任一步失败均返回 False（调用方据此决定是否删原链接消息）。
+    源消息若属于相册(grouped_id)则走 process_album_link。
+    """
+    msg = await _resolve_source_message(client, parsed)
+    if msg is None:
+        return False
+
+    # 源消息属于相册 → 走相册流程
+    if msg.grouped_id is not None:
+        return await process_album_link(client, parsed, msg)
+
+    peer, _ = parsed
+    sub_dir = os.path.join(cfg.DOWNLOADS_DIR, f"link_{peer}_{msg.id}")
+
+    # 收藏夹进度消息：下载/压缩/上传各阶段节流更新，成功后删除
+    progress = SavedMessagesProgress(client)
+    title = _short_title(msg)
+    await progress.send(f"⏳ 准备下载: {title}")
+
+    path: Optional[str] = None
+    final_path: Optional[str] = None
+    try:
+        path = await _download_to_dir(client, msg, sub_dir, progress_sink=progress)
+        if not path:
+            await progress.set_text("✗ 下载失败/超时，原链接已保留")
+            return False
+
+        final_path = await _maybe_compress(path, msg, progress_sink=progress)
+        await progress.set_text("⏳ 正在上传...")
+        ok = await _send_local_file(client, final_path, msg, progress_sink=progress)
+        if ok:
+            await progress.delete()
+        else:
+            await progress.set_text("✗ 上传失败，原链接已保留")
+        return ok
+    finally:
+        # 上传完成（无论成功失败）后清理本地临时文件（原文件 + 可能的压缩件）
+        if path:
+            _safe_remove(path)
+        if final_path and final_path != path:
+            _safe_remove(final_path)
+        _cleanup_dir(sub_dir)
+
+
+# =====================================================================
 # 六、收尾删除
 # =====================================================================
 async def _delete_originals_if_enabled(
@@ -196,10 +825,21 @@ async def _delete_originals_if_enabled(
 def register_handlers(client: TelegramClient) -> None:
     """注册 NewMessage + Album 事件处理器（仅监听收藏夹）。"""
 
-    @client.on(events.NewMessage(chats=["me"], incoming=True))
+    @client.on(events.NewMessage(chats=["me"]))
     async def on_new_message(event):
-        """处理单条新消息。相册成员跳过（交给 Album 处理）。"""
+        """处理收藏夹新消息。
+
+        不能用 incoming=True：收藏夹消息都是"你发给自己的"，MTProto 的 out 标记
+        为 True，incoming=True 会把它们全过滤掉，事件永不触发。
+        本进程自己发的进度消息(⏳/✗ 开头)会被下面的守卫跳过，避免自触发回环。
+        """
         msg: Message = event.message
+
+        # 守卫：跳过本进程自己发出的进度/错误消息（避免自触发）
+        text = msg.message or ""
+        if text.startswith(("⏳", "✓", "✗")):
+            log.debug("跳过本进程进度消息 msg_id=%s", msg.id)
+            return
 
         # 相册成员跳过（避免与 Album 重复克隆）
         if msg.grouped_id is not None:
@@ -207,7 +847,19 @@ def register_handlers(client: TelegramClient) -> None:
                       msg.id, msg.grouped_id)
             return
 
-        # 纯文本无媒体 → 不处理
+        # 收藏夹链接流程优先：文本含 t.me/tg:// 分享链接即走链接下载上传。
+        # 必须在 _has_media 之前：Telegram 会给 t.me 链接生成 WebPage 预览，
+        # 此时 _has_media 为 True，会被误当媒体克隆而 send_file 失败。
+        parsed = parse_tg_link(text)
+        if parsed:
+            log.info("▶ 收到链接消息 msg_id=%s → peer=%s msg_id=%s",
+                     msg.id, parsed[0], parsed[1])
+            ok = await process_link(client, parsed)
+            if ok:
+                await _delete_originals_if_enabled(client, [msg.id])
+            return
+
+        # 媒体克隆流程：真媒体(非链接预览)才克隆
         if not _has_media(msg):
             log.debug("跳过无媒体消息 msg_id=%s", msg.id)
             return
@@ -459,6 +1111,62 @@ async def cmd_clean_forwards(limit: Optional[int] = None,
     await client.disconnect()
 
 
+async def cmd_probe(link: str, upload: bool = False) -> None:
+    """探测单条消息链接：解析 → 拉取源消息 → 下载，打印结果。
+
+    默认仅下载到 downloads/ 不上传（安全排查用）；加 --upload 才真正发到 TARGET。
+    用于排查"某条链接能不能解析/能不能下（还是受限频道会卡）"。
+    """
+    log.info("=" * 60)
+    log.info("tg-video-keeper 链接探测")
+    log.info("配置摘要:\n%s", cfg.summary())
+    log.info("=" * 60)
+
+    parsed = parse_tg_link(link)
+    if not parsed:
+        log.error("✗ 无法解析为消息链接: %s", link)
+        return
+    log.info("解析结果: peer=%s msg_id=%s", parsed[0], parsed[1])
+
+    client = make_client()
+    await client.start()
+    await init_state(client)
+
+    try:
+        msg = await _resolve_source_message(client, parsed)
+        if msg is None:
+            return
+        log.info("源消息: id=%s media=%s caption=%s",
+                 msg.id, type(msg.media).__name__, (msg.message or "")[:50])
+
+        peer, _ = parsed
+        sub_dir = os.path.join(cfg.DOWNLOADS_DIR, f"probe_{peer}_{msg.id}")
+        path = await _download_to_dir(client, msg, sub_dir)
+        if not path:
+            log.warning("✗ 下载失败或超时（可能为受限频道）")
+            return
+
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        log.info("✓ 下载完成: %s (%.2f MB)", path, size / 1024 / 1024)
+
+        # 走压缩决策（与正式流程一致），便于排查阈值是否合理
+        final_path = await _maybe_compress(path, msg)
+
+        if upload:
+            ok = await _send_local_file(client, final_path, msg)
+            log.info("上传结果: %s", "成功" if ok else "失败")
+            _safe_remove(path)
+            if final_path != path:
+                _safe_remove(final_path)
+            _cleanup_dir(sub_dir)
+        else:
+            log.info("未启用 --upload，跳过上传。文件保留在: %s", final_path)
+            if final_path != path:
+                log.info("  （原文件: %s）", path)
+    finally:
+        await client.disconnect()
+
+
 # =====================================================================
 # 十一、入口
 # =====================================================================
@@ -466,6 +1174,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="tg-video-keeper 私密媒体克隆守护进程")
     parser.add_argument("--login", action="store_true", help="首次登录，生成 session 文件")
     parser.add_argument("--check", action="store_true", help="健康检查：打印账号 + 配置，不监听")
+    parser.add_argument("--probe", metavar="LINK",
+                        help="探测单条消息链接：解析 + 下载（默认不上传，加 --upload 才发到 TARGET）")
+    parser.add_argument("--upload", action="store_true",
+                        help="配合 --probe，下载后真正上传到目标频道")
     parser.add_argument("--clean-forwards", action="store_true",
                         help="清洗目标频道中的转发消息，重新上传为自主消息")
     parser.add_argument("--limit", type=int, default=None, metavar="N",
@@ -479,6 +1191,8 @@ def main() -> None:
             asyncio.run(cmd_login())
         elif args.check:
             asyncio.run(cmd_check())
+        elif args.probe:
+            asyncio.run(cmd_probe(args.probe, upload=args.upload))
         elif args.clean_forwards:
             if args.limit:
                 log.info("启用限制模式：最多处理 %s 条", args.limit)

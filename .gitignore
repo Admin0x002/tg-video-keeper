@@ -5,6 +5,7 @@ sessions/*.session-journal
 sessions/*.json
 logs/*.log
 logs/*.log.*
+downloads/
 
 # Python
 __pycache__/

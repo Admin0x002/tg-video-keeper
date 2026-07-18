@@ -15,10 +15,12 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
+DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")  # 收藏夹链接下载的临时文件目录
 
 # 确保目录存在
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # --------------------- 必填项校验 ---------------------
 def _strip_quotes(s: str) -> str:
@@ -57,6 +59,33 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # 克隆时是否静默（不触发目标频道通知）
 SILENT_SEND: bool = os.getenv("SILENT_SEND", "true").lower() == "true"
 
+# 收藏夹链接下载的整体超时（秒）。大文件慢链路下需留足时间；
+# 配合 LINK_STALL_TIMEOUT 防止真受限频道挂起时白等。默认 3600s（1h）。
+LINK_DOWNLOAD_TIMEOUT: int = int(os.getenv("LINK_DOWNLOAD_TIMEOUT", "3600"))
+
+# 下载停滞超时（秒）：进度回调超过此秒无任何进展即判定挂起/断流，取消跳过。
+# 受限频道(noforwards)的 download_media 进度回调永不触发，靠此快速跳出。默认 60s。
+LINK_STALL_TIMEOUT: int = int(os.getenv("LINK_STALL_TIMEOUT", "60"))
+
+
+# --------------------- 视频压缩 ---------------------
+# 下载后是否按码率/时长自动压缩再上传（仅对视频生效）
+COMPRESS_VIDEO: bool = os.getenv("COMPRESS_VIDEO", "true").lower() == "true"
+
+# 压缩触发阈值：源码率(Mbps)超过此值才压；低于则认为已高效、跳过。
+# 例：200MB/1min≈26Mbps(压)，200MB/30min≈0.9Mbps(跳过)。
+COMPRESS_BITRATE_THRESHOLD: int = int(os.getenv("COMPRESS_BITRATE_THRESHOLD", "6"))
+
+# 甜点编码参数：H.264 CRF + 码率上限 + 音频码率 + 预设
+COMPRESS_CRF: int = int(os.getenv("COMPRESS_CRF", "24"))
+COMPRESS_MAXRATE: str = os.getenv("COMPRESS_MAXRATE", "5M")
+COMPRESS_BUFSIZE: str = os.getenv("COMPRESS_BUFSIZE", "8M")
+COMPRESS_PRESET: str = os.getenv("COMPRESS_PRESET", "veryfast")
+COMPRESS_AUDIO_BITRATE: str = os.getenv("COMPRESS_AUDIO_BITRATE", "128k")
+
+# 小于此大小(MB)不压缩(不值得)
+COMPRESS_MIN_SIZE_MB: int = int(os.getenv("COMPRESS_MIN_SIZE_MB", "20"))
+
 
 def summary() -> str:
     """生成配置摘要（脱敏），用于 --check 输出。"""
@@ -67,5 +96,10 @@ def summary() -> str:
         f"DELETE_ORIGINAL_FROM_SAVED={DELETE_ORIGINAL_FROM_SAVED}\n"
         f"SESSION_NAME={SESSION_NAME}\n"
         f"SILENT_SEND={SILENT_SEND}\n"
+        f"LINK_DOWNLOAD_TIMEOUT={LINK_DOWNLOAD_TIMEOUT}\n"
+        f"LINK_STALL_TIMEOUT={LINK_STALL_TIMEOUT}\n"
+        f"COMPRESS_VIDEO={COMPRESS_VIDEO}\n"
+        f"COMPRESS_BITRATE_THRESHOLD={COMPRESS_BITRATE_THRESHOLD}\n"
+        f"COMPRESS_CRF={COMPRESS_CRF} / MAXRATE={COMPRESS_MAXRATE} / PRESET={COMPRESS_PRESET}\n"
         f"LOG_LEVEL={LOG_LEVEL}"
     )
