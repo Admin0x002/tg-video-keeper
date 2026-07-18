@@ -429,6 +429,7 @@ async def _download_to_dir(
     进度回调每收 5% 打一行，便于区分"在下载只是慢"与"挂起"。
     成功返回路径，失败/超时返回 None。
     """
+    log.info("⚠ [diag] 进入 _download_to_dir msg_id=%s", msg.id)
     os.makedirs(sub_dir, exist_ok=True)
     state = {"last_progress": time.monotonic(), "pct": -1, "got_bytes": False}
 
@@ -456,6 +457,7 @@ async def _download_to_dir(
     task = asyncio.create_task(
         client.download_media(msg, file=sub_dir, progress_callback=_progress)
     )
+    log.info("⚠ [diag] task 已创建,进入循环 msg_id=%s", msg.id)
     start = time.monotonic()
     max_timeout = cfg.LINK_DOWNLOAD_TIMEOUT
     stall_timeout = cfg.LINK_STALL_TIMEOUT
@@ -468,6 +470,9 @@ async def _download_to_dir(
             except asyncio.TimeoutError:
                 pass
             now = time.monotonic()
+            log.info("⚠ [diag] tick stall=%.0fs pct=%s got=%s msg_id=%s",
+                     now - state["last_progress"], state["pct"],
+                     state["got_bytes"], msg.id)
             if now - state["last_progress"] > stall_timeout:
                 task.cancel()
                 if state["got_bytes"]:
@@ -535,6 +540,7 @@ async def _send_local_file(
             caption=src_msg.message,
             formatting_entities=src_msg.entities,
             silent=cfg.SILENT_SEND,
+            supports_streaming=True,  # 视频置流式属性，目标端可边下边播而非必须下完
             progress_callback=_upload_progress,
         )
         sent_id = getattr(sent, "id", "?")
@@ -574,6 +580,26 @@ def _safe_remove(path: str) -> None:
         log.debug("删除文件失败（忽略）: %s", path)
 
 
+def _cleanup_local_files(paths: List[str], sub_dir: str) -> None:
+    """上传后清理本地临时文件与子目录。
+
+    KEEP_LOCAL_FILE_AFTER_UPLOAD=true 时保留，仅打印路径（便于用
+    ffmpeg/ffprobe 核对视频元数据/可播放性）；否则删除文件并清空子目录。
+    """
+    kept: List[str] = []
+    for p in paths:
+        if p and p not in kept:
+            kept.append(p)
+    if cfg.KEEP_LOCAL_FILE_AFTER_UPLOAD:
+        for p in kept:
+            log.info("保留本地文件(KEEP_LOCAL_FILE_AFTER_UPLOAD=true): %s", p)
+        log.info("保留下载子目录: %s", sub_dir)
+        return
+    for p in kept:
+        _safe_remove(p)
+    _cleanup_dir(sub_dir)
+
+
 async def _maybe_compress(
     path: str,
     msg: Message,
@@ -599,7 +625,15 @@ async def _maybe_compress(
             probe.size_bytes / 1048576, probe.duration,
             cmp.source_bitrate_mbps(probe),
         )
-        return path
+        # 跳过重编码，但仍做 faststart 重封(移 moov 到头部)，
+        # 否则上传后视频无法在 Telegram 边下边播(需下完才能播)。
+        fs_path = await asyncio.to_thread(
+            cmp.ensure_faststart, path, probe,
+            lambda m: log.info("  ffmpeg(fs): %s", m),
+        )
+        if fs_path != path:
+            log.info("✓ faststart 重封完成 msg_id=%s → %s", msg.id, os.path.basename(fs_path))
+        return fs_path
 
     dst = f"{os.path.splitext(path)[0]}_compressed.mp4"
     if progress_sink is not None:
@@ -682,6 +716,7 @@ async def _send_album(
             file=paths,
             caption=captions,
             silent=cfg.SILENT_SEND,
+            supports_streaming=True,  # 视频置流式属性，目标端可边下边播而非必须下完
             progress_callback=_upload_progress,
         )
         first_id = getattr(sent[0], "id", "?") if isinstance(sent, list) else getattr(sent, "id", "?")
@@ -745,9 +780,7 @@ async def process_album_link(
             await progress.set_text("✗ 相册上传失败,原链接已保留")
         return ok
     finally:
-        for p in final_paths:
-            _safe_remove(p)
-        _cleanup_dir(sub_dir)
+        _cleanup_local_files(final_paths, sub_dir)
 
 
 async def process_link(
@@ -793,11 +826,7 @@ async def process_link(
         return ok
     finally:
         # 上传完成（无论成功失败）后清理本地临时文件（原文件 + 可能的压缩件）
-        if path:
-            _safe_remove(path)
-        if final_path and final_path != path:
-            _safe_remove(final_path)
-        _cleanup_dir(sub_dir)
+        _cleanup_local_files([path, final_path], sub_dir)
 
 
 # =====================================================================
@@ -1155,10 +1184,7 @@ async def cmd_probe(link: str, upload: bool = False) -> None:
         if upload:
             ok = await _send_local_file(client, final_path, msg)
             log.info("上传结果: %s", "成功" if ok else "失败")
-            _safe_remove(path)
-            if final_path != path:
-                _safe_remove(final_path)
-            _cleanup_dir(sub_dir)
+            _cleanup_local_files([path, final_path], sub_dir)
         else:
             log.info("未启用 --upload，跳过上传。文件保留在: %s", final_path)
             if final_path != path:

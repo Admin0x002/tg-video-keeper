@@ -6,6 +6,9 @@ requires-python = ">=3.11"
 dependencies = [
     "telethon==1.44.0",
     "python-dotenv==1.0.1",
+    # Telethon 靠 hachoir 解析本地视频/音频元数据(时长/宽高)写入
+    # DocumentAttributeVideo；缺失会导致上传后 Telegram 显示时长=0、无法播放。
+    "hachoir>=3.3.0",
 ]
 
 [dependency-groups]

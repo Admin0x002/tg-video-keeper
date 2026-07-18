@@ -67,6 +67,10 @@ LINK_DOWNLOAD_TIMEOUT: int = int(os.getenv("LINK_DOWNLOAD_TIMEOUT", "3600"))
 # 受限频道(noforwards)的 download_media 进度回调永不触发，靠此快速跳出。默认 60s。
 LINK_STALL_TIMEOUT: int = int(os.getenv("LINK_STALL_TIMEOUT", "60"))
 
+# 上传后是否保留本地临时文件（用于用 ffmpeg/ffprobe 核对视频元数据/可播放性）。
+# true=保留本地文件与下载子目录，不清理；false=上传后清理（默认，保持干净）。
+KEEP_LOCAL_FILE_AFTER_UPLOAD: bool = os.getenv("KEEP_LOCAL_FILE_AFTER_UPLOAD", "false").lower() == "true"
+
 
 # --------------------- 视频压缩 ---------------------
 # 下载后是否按码率/时长自动压缩再上传（仅对视频生效）
@@ -98,6 +102,7 @@ def summary() -> str:
         f"SILENT_SEND={SILENT_SEND}\n"
         f"LINK_DOWNLOAD_TIMEOUT={LINK_DOWNLOAD_TIMEOUT}\n"
         f"LINK_STALL_TIMEOUT={LINK_STALL_TIMEOUT}\n"
+        f"KEEP_LOCAL_FILE_AFTER_UPLOAD={KEEP_LOCAL_FILE_AFTER_UPLOAD}\n"
         f"COMPRESS_VIDEO={COMPRESS_VIDEO}\n"
         f"COMPRESS_BITRATE_THRESHOLD={COMPRESS_BITRATE_THRESHOLD}\n"
         f"COMPRESS_CRF={COMPRESS_CRF} / MAXRATE={COMPRESS_MAXRATE} / PRESET={COMPRESS_PRESET}\n"

@@ -144,3 +144,49 @@ def compress_video(src: str, dst: str, log_fn=None) -> bool:
             log_fn("ffmpeg 失败: " + (r.stderr or "")[-500:])
         return False
     return os.path.exists(dst)
+
+
+def ensure_faststart(src: str, probe: Optional[MediaProbe], log_fn=None) -> str:
+    """对视频做 faststart 重封(不重编码)，把 moov atom 移到文件头部。
+
+    目的：让上传后的视频在 Telegram 可边下边播（supports_streaming=True 的前提
+    是 moov 在头部；moov 在尾部的 mp4 即便置流式属性也必须下完才能播）。
+
+    仅做 `-c copy` 重封，秒级、不损失画质。已 faststart 的文件重封后仍是 faststart。
+    非视频 / probe 缺失 / 失败 → 返回原 src 路径。
+    成功 → 返回新文件路径（与 src 同目录、`_fs` 后缀），原 src 保留由调用方清理。
+    """
+    if probe is None or not probe.is_video:
+        return src
+    if not src or not os.path.exists(src):
+        return src
+
+    base, ext = os.path.splitext(src)
+    dst = f"{base}_fs{ext or '.mp4'}"
+    cmd = [
+        "ffmpeg", "-y", "-i", src,
+        "-c", "copy", "-movflags", "+faststart",
+        dst,
+    ]
+    # 重封很快；给 60s 兜底（大文件重封也远快于重编码）
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        if log_fn:
+            log_fn(f"faststart 重封跳过: {e}")
+        return src
+    if r.returncode != 0 or not os.path.exists(dst):
+        if log_fn:
+            log_fn("faststart 重封失败: " + (r.stderr or "")[-300:])
+        _safe_remove_local(dst)
+        return src
+    return dst
+
+
+def _safe_remove_local(path: str) -> None:
+    """安全删除单个文件（忽略错误），compress 模块内部用。"""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
