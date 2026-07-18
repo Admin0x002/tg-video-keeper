@@ -1,31 +1,23 @@
 [Unit]
-Description=tg-video-keeper — 私密 Telegram 媒体克隆守护进程
+Description=tg-video-keeper 媒体克隆守护进程
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/opt/tg-video-keeper
+ExecStart=/root/.local/bin/uv run python -u keeper.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/tg-video-keeper/logs/systemd.log
+StandardError=append:/opt/tg-video-keeper/logs/systemd.log
 
-# ↓↓↓ 按你的实际环境修改以下三行 ↓↓↓
-# 准备：先运行 `uv sync --all-groups` 创建 .venv（uv 管理依赖，无需手动 venv/pip）
-User=emiya
-WorkingDirectory=/home/emiya/data/workspace/tg-video-keeper
-ExecStart=/home/emiya/data/workspace/tg-video-keeper/.venv/bin/python /home/emiya/data/workspace/tg-video-keeper/keeper.py
-
-# 自动重启：进程异常退出后 5 秒重启
-Restart=always
-RestartSec=5
-
-# 日志输出到 journald
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=tg-video-keeper
-
-# 环境变量（如需覆盖 .env，可在此注入；默认读 .env）
-#Environment=LOG_LEVEL=INFO
-
-# 资源限制
-MemoryMax=512M
+NoNewPrivileges=yes
+ProtectSystem=strict
+# ProtectSystem=strict 把整盘设为只读,仅放行下列路径。
+# downloads/ 必须在内 —— 否则 keeper.py:433 os.makedirs 抛 EROFS,
+# 异常逃逸出事件处理器,表现为"准备下载"永久挂死。
+ReadWritePaths=/opt/tg-video-keeper/sessions /opt/tg-video-keeper/logs /opt/tg-video-keeper/downloads
 
 [Install]
 WantedBy=multi-user.target
