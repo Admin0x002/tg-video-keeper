@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from logging.handlers import RotatingFileHandler
@@ -524,8 +525,13 @@ async def _send_local_file(
     file_path: str,
     src_msg: Message,
     progress_sink: Optional[SavedMessagesProgress] = None,
+    thumb: Optional[str] = None,
 ) -> bool:
-    """把本地下载好的文件上传到目标备份频道，不带转发头。"""
+    """把本地下载好的文件上传到目标备份频道，不带转发头。
+
+    thumb 由调用方在下载后、上传前提前提取并传入（None=无缩略图）。
+    """
+
     def _upload_progress(sent: int, total: int) -> None:
         if progress_sink is not None and total > 0:
             pct = int(sent * 100 / total)
@@ -537,6 +543,7 @@ async def _send_local_file(
         sent = await client.send_file(
             TARGET_PEER,
             file=file_path,
+            thumb=thumb,
             caption=src_msg.message,
             formatting_entities=src_msg.entities,
             silent=cfg.SILENT_SEND,
@@ -560,6 +567,51 @@ async def _send_local_file(
     except Exception as e:
         log.exception("✗ 上传失败(未知) msg_id=%s: %s", src_msg.id, e)
         return False
+
+
+def _ffmpeg_extract_frame(video_path: str, output_path: str) -> Optional[str]:
+    """用 ffmpeg 从视频中抽取一帧作为封面。
+
+    取视频 10% 位置（最短 3s，最长 30s）的帧，输出 JPEG。
+    在线程池中调用（不阻塞事件循环）。失败返回 None。
+    """
+    # 探测时长以选取合适的抽帧位置
+    probe = cmp.probe_media(video_path)
+    seek_sec = 5.0
+    if probe is not None and probe.duration > 0:
+        seek_sec = max(3.0, min(probe.duration * 0.1, 30.0))
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(seek_sec),
+        "-i", video_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        output_path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if r.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return output_path
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    _safe_remove(output_path)
+    return None
+
+
+async def _extract_thumbnail(
+    video_path: str,
+    file_dir: str,
+) -> Optional[str]:
+    """用 ffmpeg 从已下载视频中抽一帧作为封面（JPEG）。
+
+    受限频道的 Telegram 缩略图接口不可用，统一走 ffmpeg。
+    非视频文件或抽帧失败返回 None。
+    """
+    if not video_path or not os.path.exists(video_path):
+        return None
+    output = os.path.join(file_dir, "thumb.jpg")
+    return await asyncio.to_thread(_ffmpeg_extract_frame, video_path, output)
 
 
 def _cleanup_dir(path: str) -> None:
@@ -609,11 +661,26 @@ async def _maybe_compress(
 
     返回最终要上传的路径（压缩后的或原文件）。压缩失败/未变小/无需压缩 → 原文件。
     ffmpeg 在线程池运行（asyncio.to_thread），不阻塞事件循环。
+
+    无论是否需要压缩，视频文件都会做 faststart 重封（moov→头部），
+    否则上传后即便 supports_streaming=True 也无法边下边播。
     """
+
+    def _log_ff(msg2: str) -> None:
+        log.info("  ffmpeg(fs): %s", msg2)
+
+    # 始终先探测，用于决定是否需要压缩以及是否需要 faststart
+    probe = cmp.probe_media(path)
+
     if not cfg.COMPRESS_VIDEO:
+        # 不压缩，但仍对视频做 faststart（否则 Telegram 无法流式播放）
+        if probe is not None and probe.is_video:
+            fs_path = await asyncio.to_thread(cmp.ensure_faststart, path, probe, _log_ff)
+            if fs_path != path:
+                log.info("✓ faststart 重封完成 msg_id=%s → %s", msg.id, os.path.basename(fs_path))
+            return fs_path
         return path
 
-    probe = cmp.probe_media(path)
     if probe is None:
         log.warning("跳过压缩：ffprobe 失败，上传原文件 msg_id=%s", msg.id)
         return path
@@ -627,10 +694,7 @@ async def _maybe_compress(
         )
         # 跳过重编码，但仍做 faststart 重封(移 moov 到头部)，
         # 否则上传后视频无法在 Telegram 边下边播(需下完才能播)。
-        fs_path = await asyncio.to_thread(
-            cmp.ensure_faststart, path, probe,
-            lambda m: log.info("  ffmpeg(fs): %s", m),
-        )
+        fs_path = await asyncio.to_thread(cmp.ensure_faststart, path, probe, _log_ff)
         if fs_path != path:
             log.info("✓ faststart 重封完成 msg_id=%s → %s", msg.id, os.path.basename(fs_path))
         return fs_path
@@ -810,15 +874,20 @@ async def process_link(
 
     path: Optional[str] = None
     final_path: Optional[str] = None
+    thumb: Optional[str] = None
     try:
         path = await _download_to_dir(client, msg, sub_dir, progress_sink=progress)
         if not path:
             await progress.set_text("✗ 下载失败/超时，原链接已保留")
             return False
 
+        # 下载完成后用 ffmpeg 从视频抽帧作封面（受限频道 Telegram 接口不可用）
+        await progress.set_text("⏳ 提取封面...")
+        thumb = await _extract_thumbnail(path, os.path.dirname(path))
+
         final_path = await _maybe_compress(path, msg, progress_sink=progress)
         await progress.set_text("⏳ 正在上传...")
-        ok = await _send_local_file(client, final_path, msg, progress_sink=progress)
+        ok = await _send_local_file(client, final_path, msg, progress_sink=progress, thumb=thumb)
         if ok:
             await progress.delete()
         else:
