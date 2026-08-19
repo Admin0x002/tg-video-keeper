@@ -72,6 +72,18 @@ LINK_STALL_TIMEOUT: int = int(os.getenv("LINK_STALL_TIMEOUT", "60"))
 KEEP_LOCAL_FILE_AFTER_UPLOAD: bool = os.getenv("KEEP_LOCAL_FILE_AFTER_UPLOAD", "false").lower() == "true"
 
 
+# --------------------- X 视频下载 ---------------------
+# X(Twitter) 视频链接下载的 cookies 文件路径(Netscape 格式,浏览器扩展可导出)。
+# 公开推文无需 cookies;私有推文/403 时才需要。留空=yt-dlp 不带 cookies。
+X_COOKIES_FILE: str = os.getenv("X_COOKIES_FILE", "").strip()
+
+# X 下载整体超时(秒)。默认 3600,与 LINK_DOWNLOAD_TIMEOUT 语义一致。
+X_DOWNLOAD_TIMEOUT: int = int(os.getenv("X_DOWNLOAD_TIMEOUT", "3600"))
+
+# X 下载停滞超时(秒):进度回调超过此秒无进展即判定挂起,取消跳过。默认 60。
+X_STALL_TIMEOUT: int = int(os.getenv("X_STALL_TIMEOUT", "60"))
+
+
 # --------------------- 视频压缩 ---------------------
 # 下载后是否按码率/时长自动压缩再上传（仅对视频生效）
 COMPRESS_VIDEO: bool = os.getenv("COMPRESS_VIDEO", "true").lower() == "true"
@@ -103,6 +115,9 @@ def summary() -> str:
         f"LINK_DOWNLOAD_TIMEOUT={LINK_DOWNLOAD_TIMEOUT}\n"
         f"LINK_STALL_TIMEOUT={LINK_STALL_TIMEOUT}\n"
         f"KEEP_LOCAL_FILE_AFTER_UPLOAD={KEEP_LOCAL_FILE_AFTER_UPLOAD}\n"
+        f"X_COOKIES_FILE={X_COOKIES_FILE or '(未设置)'}\n"
+        f"X_DOWNLOAD_TIMEOUT={X_DOWNLOAD_TIMEOUT}\n"
+        f"X_STALL_TIMEOUT={X_STALL_TIMEOUT}\n"
         f"COMPRESS_VIDEO={COMPRESS_VIDEO}\n"
         f"COMPRESS_BITRATE_THRESHOLD={COMPRESS_BITRATE_THRESHOLD}\n"
         f"COMPRESS_CRF={COMPRESS_CRF} / MAXRATE={COMPRESS_MAXRATE} / PRESET={COMPRESS_PRESET}\n"

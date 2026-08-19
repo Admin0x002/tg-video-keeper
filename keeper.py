@@ -43,6 +43,7 @@ from telethon.tl.types import MessageMediaEmpty, MessageMediaWebPage
 
 import compress as cmp
 import config as cfg
+import x_downloader as xdl
 
 
 # =====================================================================
@@ -383,8 +384,16 @@ class SavedMessagesProgress:
         if not self.msg_id:
             return
         try:
-            await self._client.edit_message(self._chat, self.msg_id, text)
+            # 30s 超时兜底:Telegram 请求(flood/连接挂起)可能长时间不返回,
+            # 不能让进度消息编辑阻塞整个下载/上传流程。
+            await asyncio.wait_for(
+                self._client.edit_message(self._chat, self.msg_id, text),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            log.warning("⚠ 进度消息编辑超时(30s),跳过本次更新")
         except FloodWaitError as e:
+            log.warning("⚠ 进度消息编辑限流 %ss", e.seconds)
             await asyncio.sleep(e.seconds + 1)
             try:
                 await self._client.edit_message(self._chat, self.msg_id, text)
@@ -526,10 +535,12 @@ async def _send_local_file(
     src_msg: Message,
     progress_sink: Optional[SavedMessagesProgress] = None,
     thumb: Optional[str] = None,
+    caption: Optional[str] = None,
 ) -> bool:
     """把本地下载好的文件上传到目标备份频道，不带转发头。
 
     thumb 由调用方在下载后、上传前提前提取并传入（None=无缩略图）。
+    caption 为空时默认用原消息文本（t.me 流程：原链接文本；X 流程：推文标题）。
     """
 
     def _upload_progress(sent: int, total: int) -> None:
@@ -540,15 +551,19 @@ async def _send_local_file(
                                  total_mb=total / 1048576)
 
     try:
-        sent = await client.send_file(
-            TARGET_PEER,
-            file=file_path,
-            thumb=thumb,
-            caption=src_msg.message,
-            formatting_entities=src_msg.entities,
-            silent=cfg.SILENT_SEND,
-            supports_streaming=True,  # 视频置流式属性，目标端可边下边播而非必须下完
-            progress_callback=_upload_progress,
+        # 10min 超时兜底:上传大文件/连接挂起时不得永久阻塞
+        sent = await asyncio.wait_for(
+            client.send_file(
+                TARGET_PEER,
+                file=file_path,
+                thumb=thumb,
+                caption=caption if caption is not None else src_msg.message,
+                formatting_entities=src_msg.entities,
+                silent=cfg.SILENT_SEND,
+                supports_streaming=True,  # 视频置流式属性，目标端可边下边播而非必须下完
+                progress_callback=_upload_progress,
+            ),
+            timeout=600,
         )
         sent_id = getattr(sent, "id", "?")
         log.info(
@@ -557,6 +572,9 @@ async def _send_local_file(
             type(src_msg.media).__name__,
         )
         return True
+    except asyncio.TimeoutError:
+        log.error("✗ 上传超时(600s) src_msg_id=%s file=%s", src_msg.id, file_path)
+        return False
     except FloodWaitError as e:
         log.warning("⚠ 上传限流 %ss，等待后重试 msg_id=%s", e.seconds, src_msg.id)
         await asyncio.sleep(e.seconds + 1)
@@ -611,7 +629,16 @@ async def _extract_thumbnail(
     if not video_path or not os.path.exists(video_path):
         return None
     output = os.path.join(file_dir, "thumb.jpg")
-    return await asyncio.to_thread(_ffmpeg_extract_frame, video_path, output)
+    try:
+        # 120s 超时兜底:ffmpeg 异常(文件异常/卡死)不得阻塞流程
+        return await asyncio.wait_for(
+            asyncio.to_thread(_ffmpeg_extract_frame, video_path, output),
+            timeout=120,
+        )
+    except asyncio.TimeoutError:
+        log.warning("⚠ 封面抽帧超时(120s),跳过封面")
+        _safe_remove(output)
+        return None
 
 
 def _cleanup_dir(path: str) -> None:
@@ -898,6 +925,50 @@ async def process_link(
         _cleanup_local_files([path, final_path], sub_dir)
 
 
+async def process_x_link(
+    client: TelegramClient,
+    url: str,
+    src_msg: Message,
+) -> bool:
+    """X 链接流程:yt-dlp 下载 → 抽帧封面 → 压缩 → 上传目标频道。
+
+    成功返回 True;任一步失败返回 False(调用方据此决定是否删原链接消息)。
+    下载与失败文案由 x_downloader.download_x_video 负责;此处仅编排复用
+    现有 t.me 流程的封面/压缩/上传/清理。
+    """
+    sub_dir = os.path.join(cfg.DOWNLOADS_DIR, f"x_{src_msg.id}")
+    progress = SavedMessagesProgress(client)
+    await progress.send("⏳ 正在获取 X 视频信息...")
+
+    path: Optional[str] = None
+    final_path: Optional[str] = None
+    thumb: Optional[str] = None
+    try:
+        result = await xdl.download_x_video(url, sub_dir, progress_sink=progress)
+        if not result:
+            return False
+        path, title = result
+
+        # 下载完成后用 ffmpeg 从视频抽帧作封面(与 t.me 流程一致)
+        await progress.set_text("⏳ 提取封面...")
+        thumb = await _extract_thumbnail(path, os.path.dirname(path))
+
+        final_path = await _maybe_compress(path, src_msg, progress_sink=progress)
+        await progress.set_text("⏳ 正在上传...")
+        ok = await _send_local_file(
+            client, final_path, src_msg,
+            progress_sink=progress, thumb=thumb, caption=title,
+        )
+        if ok:
+            await progress.delete()
+        else:
+            await progress.set_text("✗ 上传失败，原链接已保留")
+        return ok
+    finally:
+        # 上传完成(无论成功失败)后清理本地临时文件(原文件 + 可能的压缩件)
+        _cleanup_local_files([path, final_path], sub_dir)
+
+
 # =====================================================================
 # 六、收尾删除
 # =====================================================================
@@ -953,6 +1024,16 @@ def register_handlers(client: TelegramClient) -> None:
             log.info("▶ 收到链接消息 msg_id=%s → peer=%s msg_id=%s",
                      msg.id, parsed[0], parsed[1])
             ok = await process_link(client, parsed)
+            if ok:
+                await _delete_originals_if_enabled(client, [msg.id])
+            return
+
+        # X 链接流程：文本含 x.com/twitter.com 推文链接即走 X 下载上传。
+        # 同样必须在 _has_media 之前：Telegram 会给 x.com 链接生成 WebPage 预览。
+        x_url = xdl.parse_x_link(text)
+        if x_url:
+            log.info("▶ 收到 X 链接消息 msg_id=%s url=%s", msg.id, x_url)
+            ok = await process_x_link(client, x_url, msg)
             if ok:
                 await _delete_originals_if_enabled(client, [msg.id])
             return
@@ -1037,6 +1118,7 @@ async def run() -> None:
     log.info("✓ 已注册事件处理器，开始监听收藏夹")
     log.info("  - 单条媒体: NewMessage")
     log.info("  - 相册:     Album")
+    log.info("  - X 链接:  文本含 x.com/twitter.com 链接 → 下载上传")
     log.info("  - 克隆后删除原消息: %s", cfg.DELETE_ORIGINAL_FROM_SAVED)
     log.info("守护进程运行中，按 Ctrl+C 退出...")
 
